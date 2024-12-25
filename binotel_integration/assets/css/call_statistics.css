@@ -1,0 +1,94 @@
+.incoming-call {
+    background-color: #e6ffe6; /* Світло голубий для вхідних дзвінків */
+}
+
+.outgoing-call {
+    background-color: #e6f7ff; /* Світло зелений для вихідних дзвінків */
+}
+
+.missed-incoming-call {
+    background-color: #ffe6e6; /* Світло червоний для неприйнятих вхідних дзвінків */
+}
+
+.missed-outgoing-call {
+    background-color: #ffe6e6; /* Світло червоний для неприйнятих вихідних дзвінків */
+}
+
+.fas.fa-long-arrow-alt-up {
+    font-weight: bold; /* Зробити стрілочки товстішими */
+    font-size: 1.4em; /* Збільшити розмір стрілочок */
+    transform: rotate(317deg); /* Нахилити стрілочку вправо */
+     margin-right: 10px; /* Додати пробіл між стрілкою і текстом */
+}
+
+.fas.fa-long-arrow-alt-up::after {
+    content: '';
+    display: inline-block;
+    width: 1px;
+    height: 24px;
+    background-color: #ccc; /* Сірий колір полоски */
+    margin-left: 8px; /* Відступ від стрілочки */
+    position: absolute;
+    right: -12px; /* Позиціонування полоски */
+    top: 50%;
+    transform: translateY(-50%);
+}
+
+
+.fas.fa-long-arrow-alt-down {
+    font-weight: bold; /* Зробити стрілочки товстішими */
+    font-size: 1.4em; /* Збільшити розмір стрілочок */
+    transform: rotate(-45deg); /* Нахилити стрілочку вправо */
+    margin-right: 10px; /* Додати пробіл між стрілкою і текстом */
+}
+
+.fas.fa-long-arrow-alt-down::after {
+    content: '';
+    display: inline-block;
+    width: 1px;
+    height: 24px;
+    background-color: #ccc; /* Сірий колір полоски */
+    margin-left: 8px; /* Відступ від стрілочки */
+    position: absolute;
+    right: -12px; /* Позиціонування полоски */
+    top: 50%;
+    transform: translateY(-50%);
+}
+
+
+
+
+
+@media (max-width: 768px) {
+    .table-responsive {
+        overflow-x: auto;
+    }
+
+    .table thead {
+        display: none;
+    }
+
+    .table tbody tr {
+        display: block;
+        margin-bottom: 10px;
+    }
+
+    .table tbody tr td {
+        display: block;
+        text-align: right;
+        font-size: 14px;
+        border-bottom: 1px solid #dee2e6;
+    }
+
+    .table tbody tr td:before {
+        content: attr(data-label);
+        float: left;
+        font-weight: bold;
+    }
+
+    .table tbody tr td:last-child {
+        border-bottom: 0;
+    }
+}
+
+
