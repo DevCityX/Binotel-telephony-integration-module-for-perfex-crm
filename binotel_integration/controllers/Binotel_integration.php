@@ -13,37 +13,34 @@ class Binotel_integration extends CI_Controller {
     }
 
     public function receive_call() {
-       if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-        http_response_code(405);
-        echo 'Only POST requests are allowed.';
-        return;
-    }
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            $this->json_response(['status' => 'error', 'message' => 'Only POST requests are allowed.'], 405);
+        }
 
-    // Перевірка, чи запит йде від дозволених IP-адрес
-    $allowed_ips = [
-        '194.88.218.116', '194.88.218.114', '194.88.218.117', '194.88.218.118',
-        '194.88.219.67', '194.88.219.78', '194.88.219.70', '194.88.219.71',
-        '194.88.219.72', '194.88.219.79', '194.88.219.80', '194.88.219.81',
-        '194.88.219.82', '194.88.219.83', '194.88.219.84', '194.88.219.85',
-        '194.88.219.86', '194.88.219.87', '194.88.219.88', '194.88.219.89',
-        '194.88.219.92', '194.88.218.119', '194.88.218.120', '185.100.66.145',
-        '185.100.66.146', '45.91.130.82', '45.91.130.36'
-    ];
+        // Перевірка, чи запит йде від дозволених IP-адрес
+        $allowed_ips = [
+            '194.88.218.116', '194.88.218.114', '194.88.218.117', '194.88.218.118',
+            '194.88.219.67', '194.88.219.78', '194.88.219.70', '194.88.219.71',
+            '194.88.219.72', '194.88.219.79', '194.88.219.80', '194.88.219.81',
+            '194.88.219.82', '194.88.219.83', '194.88.219.84', '194.88.219.85',
+            '194.88.219.86', '194.88.219.87', '194.88.219.88', '194.88.219.89',
+            '194.88.219.92', '194.88.218.119', '194.88.218.120', '185.100.66.145',
+            '185.100.66.146', '45.91.130.82', '45.91.130.36'
+        ];
 
-    if (!in_array($_SERVER['REMOTE_ADDR'], $allowed_ips)) {
-        http_response_code(403);
-        echo 'Access denied: ' . $_SERVER['REMOTE_ADDR'];
-        return;
-    }
+        if (!in_array($_SERVER['REMOTE_ADDR'], $allowed_ips)) {
+            $this->json_response([
+                'status'  => 'error',
+                'message' => 'Access denied: ' . $_SERVER['REMOTE_ADDR'],
+            ], 403);
+        }
 
-    // Отримання та розбір даних у вигляді querystring
-    parse_str(file_get_contents('php://input'), $data);
+        // Отримання та розбір даних у вигляді querystring
+        parse_str(file_get_contents('php://input'), $data);
 
-    if (empty($data)) {
-        http_response_code(400);
-        echo 'Invalid data received.';
-        return;
-    }
+        if (empty($data)) {
+            $this->json_response(['status' => 'error', 'message' => 'Invalid data received.'], 400);
+        }
 
         $phone_number = isset($data['callDetails']['externalNumber']) ? $data['callDetails']['externalNumber'] : null;
         $call_recording_link = isset($data['callDetails']['linkToCallRecordInMyBusiness']) ? $data['callDetails']['linkToCallRecordInMyBusiness'] : '';
@@ -125,9 +122,9 @@ class Binotel_integration extends CI_Controller {
                 }
             }
         }
-        echo json_encode(['status' => 'success']);
+        $this->json_response(['status' => 'success']);
     } else {
-        echo "Номер телефону не надано.";
+        $this->json_response(['status' => 'error', 'message' => 'Номер телефону не надано.'], 400);
     }
 }
 
@@ -250,8 +247,7 @@ private function update_lead_last_contact($lead_id, $datetime) {
         $phone_number = $this->input->post('phone');
 
         if (empty($phone_number)) {
-            echo json_encode(['status' => 'error', 'message' => 'Номер телефону не вказано.']);
-            return;
+            $this->json_response(['status' => 'error', 'message' => 'Номер телефону не вказано.'], 400);
         }
 
         $apiKey = '11111111'; // Змініть на ваш ключ
@@ -259,7 +255,7 @@ private function update_lead_last_contact($lead_id, $datetime) {
 
         $response = $this->make_binotel_call($phone_number, $apiKey, $secret);
 
-        echo json_encode(['status' => 'success', 'message' => $response]);
+        $this->json_response(['status' => 'success', 'message' => $response]);
     }
     
     
@@ -300,7 +296,11 @@ private function update_lead_last_contact($lead_id, $datetime) {
     }
     
     // Функція для фільтрування дзвінків по даті в картці ліда
-  public function get_filtered_calls() {
+  public function get_filtered_calls_for_lead() {
+    if (!$this->input->is_ajax_request()) {
+        show_404();
+    }
+
     $lead_id = $this->input->post('lead_id');
     $start_date = $this->input->post('start_date');
     $end_date = $this->input->post('end_date');
@@ -310,14 +310,18 @@ private function update_lead_last_contact($lead_id, $datetime) {
     $call_statistics = $this->Binotel_integration_model->get_lead_call_statistics($lead_id, $start_date, $end_date);
 
     if (!empty($call_statistics)) {
-        $this->load->view('call_statistics_partial_view', ['call_statistics' => $call_statistics]);
+        $this->load->view('binotel_integration/call_statistics_partial_view', ['call_statistics' => $call_statistics]);
     } else {
         echo "<p>Записів розмов за цей період не знайдено</p>";
     }
 }
 
 // Функція для фільтрування дзвінків по даті в картці ліда
-public function get_filtered_calls_for_client() {
+  public function get_filtered_calls_for_client() {
+    if (!$this->input->is_ajax_request()) {
+        show_404();
+    }
+
     $client_id = $this->input->post('client_id');
     $start_date = $this->input->post('start_date');
     $end_date = $this->input->post('end_date');
@@ -326,7 +330,7 @@ public function get_filtered_calls_for_client() {
     $call_statistics = $this->Binotel_integration_model->get_client_call_statistics($client_id, $start_date, $end_date);
 
     if (!empty($call_statistics)) {
-        $this->load->view('call_statistics_partial_view_clients', ['call_statistics' => $call_statistics]);
+        $this->load->view('binotel_integration/call_statistics_partial_view_clients', ['call_statistics' => $call_statistics]);
     } else {
         echo "<p>Записів розмов за цей період не знайдено.</p>";
     }
@@ -351,9 +355,6 @@ public function get_filtered_calls_for_client() {
     }
     
     public function get_contacts() {
-    header('Content-Type: application/json; charset=utf-8');
-    header('Cache-Control: max-age=3600'); // Кешування на 1 годину
-
     // Отримання контактів з бази даних
     $clients = $this->db->select('company as name, phonenumber as number')
                         ->from(db_prefix() . 'clients')
@@ -386,12 +387,25 @@ public function get_filtered_calls_for_client() {
         'items' => $items,
     ];
 
-    echo json_encode($response);
-}
-   
- public function view() {
-    $this->load->view('binotel_integration_view');
-}
+        header('Cache-Control: max-age=3600');
+        $this->json_response($response);
+    }
+
+    private function json_response(array $data, int $statusCode = 200)
+    {
+        if (!headers_sent()) {
+            http_response_code($statusCode);
+            header('Content-Type: application/json; charset=utf-8');
+        }
+
+        echo json_encode($data);
+        exit;
+    }
+
+    public function view()
+    {
+        $this->load->view('binotel_integration_view');
+    }
    
     
 }

@@ -63,13 +63,15 @@ hooks()->add_action('after_lead_lead_tabs', 'binotel_integration_add_call_statis
 
 function binotel_integration_add_call_statistics_tab_first($lead)
 {
-    if (!isset($lead->id)) {
-        return; // Якщо об'єкт $lead не ініціалізований, виходимо з функції
+    $CI = &get_instance();
+
+    if (!is_object($lead) || empty($lead->id) || $CI->input->is_ajax_request()) {
+        return; // Якщо об'єкт $lead не ініціалізований або це AJAX-запит, нічого не виводимо
     }
 
     // Додаємо вкладку "Статистика розмов" на початок
     echo '<li role="presentation">
-        <a href="#tab_call_statistics" aria-controls="tab_call_statistics" role="tab" data-toggle="tab"> 
+        <a href="#tab_call_statistics" aria-controls="tab_call_statistics" role="tab" data-toggle="tab">
            <i class="fa-solid fa-mobile-retro"></i> '.  _l('call_statistics') . '
         </a>
     </li>';
@@ -80,12 +82,13 @@ hooks()->add_action('after_lead_tabs_content', 'binotel_integration_add_call_sta
 
 function binotel_integration_add_call_statistics_tab_content($lead)
 {
-    if (!isset($lead->id)) {
-        return; // Якщо об'єкт $lead не ініціалізований, виходимо з функції
-    }
-    
-    echo '<div role="tabpanel" class="tab-pane" id="tab_call_statistics">';
     $CI = &get_instance();
+
+    if (!is_object($lead) || empty($lead->id) || $CI->input->is_ajax_request()) {
+        return; // Якщо об'єкт $lead не ініціалізований або це AJAX-запит, виходимо з функції
+    }
+
+    echo '<div role="tabpanel" class="tab-pane" id="tab_call_statistics">';
     $CI->load->view('binotel_integration/lead_call_statistics', ['lead' => $lead]);
     echo '</div>';
 }
