@@ -1,0 +1,417 @@
+<?php
+defined('BASEPATH') or exit('No direct script access allowed');
+
+class Binotel_integration extends CI_Controller {
+
+    public function __construct() {
+        parent::__construct();
+        // Завантаження моделей, хелперів, бібліотек
+        $this->load->model('leads_model');
+        $this->load->model('clients_model');
+        $this->load->model('staff_model');
+        $this->load->model('binotel_integration/Binotel_integration_model');
+        $this->load->helper('url');
+    }
+
+    public function receive_call() {
+        // Перевірка методу запиту
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            http_response_code(405);
+            echo 'Only POST requests are allowed.';
+            return;
+        }
+        
+        // Дозволені IP (Binotel сервери)
+        $allowed_ips = [
+            '194.88.218.116', '194.88.218.114', '194.88.218.117', '194.88.218.118',
+            '194.88.219.67', '194.88.219.78', '194.88.219.70', '194.88.219.71',
+            '194.88.219.72', '194.88.219.79', '194.88.219.80', '194.88.219.81',
+            '194.88.219.82', '194.88.219.83', '194.88.219.84', '194.88.219.85',
+            '194.88.219.86', '194.88.219.87', '194.88.219.88', '194.88.219.89',
+            '194.88.219.92', '194.88.218.119', '194.88.218.120', '185.100.66.145',
+            '185.100.66.146', '45.91.130.82', '45.91.130.36', '45.91.129.203'
+        ];
+        if (!in_array($_SERVER['REMOTE_ADDR'], $allowed_ips)) {
+            http_response_code(403);
+            echo 'Access denied: ' . $_SERVER['REMOTE_ADDR'];
+            return;
+        }
+        
+        // Читаємо вхідні дані (query string у тілі POST)
+        $raw = $this->input->raw_input_stream;
+        parse_str($raw, $data);
+        if (empty($data)) {
+            http_response_code(400);
+            echo 'Invalid data received.';
+            return;
+        }
+        
+        // Якщо запит має requestType=apiCallSettings – це запит для передачі даних CRM до Binotel
+        if (isset($data['requestType']) && $data['requestType'] === 'apiCallSettings') {
+            $phone = $data['externalNumber'] ?? '';
+            if (empty($phone)) {
+                echo json_encode(['error' => 'Phone number not provided']);
+                return;
+            }
+            // Шукаємо сутність за номером
+            $client = $this->find_client_by_phone($phone);
+            $lead   = $this->find_lead_by_phone($phone);
+            $staff  = $this->find_staff_by_phone($phone);
+            
+            if ($client) {
+                $customerName = !empty($client->company) ? $client->company : trim($client->firstname . ' ' . $client->lastname);
+                $customerLink = admin_url('clients/client/' . $client->userid . '?group=call_statistics');
+            } elseif ($lead) {
+                $customerName = $lead->name;
+                $customerLink = admin_url('leads/index/' . $lead->id);
+            } elseif ($staff) {
+                $customerName = trim($staff->firstname . ' ' . $staff->lastname);
+                $customerLink = admin_url('staff/member/' . $staff->staffid . '?group=call_statistics');
+            } else {
+                $customerName = $phone;
+                $customerLink = '';
+            }
+            echo json_encode([
+                'customerData' => [
+                    'name' => $customerName,
+                    'linkToCrmUrl' => $customerLink
+                ]
+            ]);
+            return;
+        }
+        
+        // Обробка звичайного дзвінка (без requestType=apiCallSettings)
+        $phone_number        = $data['callDetails']['externalNumber'] ?? '';
+        $call_recording_link = $data['callDetails']['linkToCallRecordInMyBusiness'] ?? '';
+        $call_type           = $data['callDetails']['callType'] ?? '';
+        $disposition         = $data['callDetails']['disposition'] ?? '';
+        $waiting_time        = $data['callDetails']['waitingTime'] ?? '';
+        $call_duration       = $data['callDetails']['callDuration'] ?? '';
+        $current_datetime    = date('Y-m-d H:i:s');
+        
+        if (empty($phone_number)) {
+            echo json_encode(['status' => 'error', 'message' => 'Phone number not provided.']);
+            return;
+        }
+        
+        $client = $this->find_client_by_phone($phone_number);
+        $lead   = $this->find_lead_by_phone($phone_number);
+        $staff  = $this->find_staff_by_phone($phone_number);
+        
+        if ($client) {
+            $this->insert_client_call_statistics($client->userid, $call_type, $current_datetime, $call_recording_link, $waiting_time, $call_duration, $phone_number);
+            $this->create_notification($phone_number, $client, null, null, $call_type, $call_recording_link, $disposition);
+        } elseif ($lead) {
+            $this->update_lead_last_contact($lead->id, $current_datetime);
+            $this->insert_lead_call_statistics($lead->id, $call_type, $current_datetime, $call_recording_link, $waiting_time, $call_duration, $phone_number);
+            $this->create_notification($phone_number, null, $lead, null, $call_type, $call_recording_link, $disposition);
+        } elseif ($staff) {
+            $this->insert_staff_call_statistics($staff->staffid, $call_type, $current_datetime, $call_recording_link, $waiting_time, $call_duration, $phone_number);
+            $this->create_notification($phone_number, null, null, $staff, $call_type, $call_recording_link, $disposition);
+        } else {
+            // Якщо номер новий – створюємо нового ліда
+            $lead_data = [
+                'name'        => $phone_number,
+                'phonenumber' => $phone_number,
+                'dateadded'   => $current_datetime,
+                'status'      => 2,
+                'source'      => 7,
+                'assigned'    => 1,
+                'addedfrom'   => 1,
+                'lastcontact' => $current_datetime
+            ];
+            $this->db->insert(db_prefix() . 'leads', $lead_data);
+            $new_lead_id = $this->db->insert_id();
+            
+            $this->insert_lead_call_statistics($new_lead_id, $call_type, $current_datetime, $call_recording_link, $waiting_time, $call_duration, $phone_number);
+            $message = '<i class="fa fa-phone" style="color:green;"></i> Вхідний дзвінок від нового ліда ' . htmlspecialchars($phone_number);
+            $notification_data = [
+                'description'     => $message,
+                'touserid'        => 1,
+                'fromcompany'     => 0,
+                'link'            => 'leads/index/' . $new_lead_id,
+                'additional_data' => serialize([$phone_number]),
+                'date'            => $current_datetime
+            ];
+            $this->db->insert(db_prefix() . 'binotel_notifications', $notification_data);
+            // Для відповіді встановлюємо дані як для ліда
+            $lead = (object)[
+                'id'   => $new_lead_id,
+                'name' => $phone_number
+            ];
+        }
+        
+        // Підготовка даних для відповіді, які передаються Бінотел
+        if ($client) {
+            $customerName = !empty($client->company) ? $client->company : trim($client->firstname . ' ' . $client->lastname);
+            $customerLink = admin_url('clients/client/' . $client->userid . '?group=call_statistics');
+        } elseif ($lead) {
+            $customerName = $lead->name;
+            $customerLink = admin_url('leads/index/' . $lead->id);
+        } elseif ($staff) {
+            $customerName = trim($staff->firstname . ' ' . $staff->lastname);
+            $customerLink = admin_url('staff/member/' . $staff->staffid . '?group=call_statistics');
+        } else {
+            $customerName = $phone_number;
+            $customerLink = '';
+        }
+        
+        // Повертаємо відповідь у форматі JSON із статусом success
+        echo json_encode([
+            'customerData' => [
+                'name' => $customerName,
+                'linkToCrmUrl' => $customerLink
+            ],
+            'status' => 'success'
+        ]);
+    }
+    
+    /* Допоміжні методи */
+    
+    private function create_notification($phone_number, $client = null, $lead = null, $staff = null, $call_type = '1', $recording_link = null, $disposition = null) {
+        $icons = [
+            'accepted' => '<i class="fa fa-phone" style="color:green;"></i>',
+            'missed' => '<i class="fas fa-phone-slash" style="color:red;"></i>',
+            'outgoing' => '<i class="fa fa-phone" style="color:blue;"></i>',
+            'missed_outgoing' => '<i class="fas fa-phone-slash" style="color:orange;"></i>'
+        ];
+    
+        $type = ($call_type == '1') ? ($recording_link ? 'outgoing' : 'missed_outgoing') : ($recording_link ? 'accepted' : 'missed');
+        $message = $icons[$type] . ' ';
+        if ($call_type == '1') {
+            $message .= $recording_link ? "Вихідний дзвінок до" : "Неприйнятий вихідний дзвінок до";
+        } else {
+            $message .= $recording_link ? "Вхідний дзвінок від" : "Неприйнятий дзвінок від";
+        }
+    
+        if ($client) {
+            $message .= " клієнта {$client->company}";
+            $link = 'clients/client/' . $client->userid . '?group=call_statistics';
+        } elseif ($lead) {
+            $message .= " ліда {$lead->name}";
+            $link = 'leads/index/' . $lead->id;
+        } elseif ($staff) {
+            $message .= " співробітника {$staff->firstname} {$staff->lastname}";
+            $link = 'staff/member/' . $staff->staffid . '?group=call_statistics';
+        } else {
+            $message .= " номером {$phone_number}";
+            $link = '';
+        }
+    
+        $notification_data = [
+            'description'     => $message,
+            'touserid'        => 1,
+            'fromcompany'     => 0,
+            'link'            => $link,
+            'additional_data' => serialize([$phone_number]),
+            'date'            => date('Y-m-d H:i:s')
+        ];
+    
+        $this->db->insert(db_prefix() . 'binotel_notifications', $notification_data);
+    }
+    
+    private function find_client_by_phone($phone_number) {
+        $this->db->like('phonenumber', $phone_number);
+        $query = $this->db->get(db_prefix() . 'clients');
+        return $query->row();
+    }
+    
+    private function find_lead_by_phone($phone_number) {
+        $this->db->like('phonenumber', $phone_number);
+        $query = $this->db->get(db_prefix() . 'leads');
+        return $query->row();
+    }
+    
+    private function find_staff_by_phone($phone_number) {
+        $this->db->like('phonenumber', $phone_number);
+        $query = $this->db->get(db_prefix() . 'staff');
+        return $query->row();
+    }
+    
+    private function insert_client_call_statistics($client_id, $call_type, $call_time, $recording_link, $waiting_time, $call_duration, $external_number) {
+        $data = [
+            'client_id'      => $client_id,
+            'call_type'      => $call_type,
+            'call_time'      => $call_time,
+            'recording_link' => $recording_link,
+            'waiting_time'   => $waiting_time,
+            'call_duration'  => $call_duration,
+            'contact_name'   => $external_number
+        ];
+        $this->db->insert(db_prefix() . 'binotel_call_statistics_clients', $data);
+    }
+    
+    private function insert_lead_call_statistics($lead_id, $call_type, $call_time, $recording_link, $waiting_time, $call_duration, $external_number) {
+        $data = [
+            'lead_id'        => $lead_id,
+            'call_type'      => $call_type,
+            'call_time'      => $call_time,
+            'recording_link' => $recording_link,
+            'waiting_time'   => $waiting_time,
+            'call_duration'  => $call_duration,
+            'contact_name'   => $external_number
+        ];
+        $this->db->insert(db_prefix() . 'binotel_call_statistics_leads', $data);
+    }
+    
+    private function insert_staff_call_statistics($staff_id, $call_type, $call_time, $recording_link, $waiting_time, $call_duration, $external_number) {
+        $data = [
+            'staff_id'       => $staff_id,
+            'call_type'      => $call_type,
+            'call_time'      => $call_time,
+            'recording_link' => $recording_link,
+            'waiting_time'   => $waiting_time,
+            'call_duration'  => $call_duration,
+            'contact_name'   => $external_number
+        ];
+        $this->db->insert(db_prefix() . 'binotel_call_statistics_staff', $data);
+    }
+    
+    private function update_lead_last_contact($lead_id, $datetime) {
+        $this->db->where('id', $lead_id);
+        $this->db->update(db_prefix() . 'leads', ['lastcontact' => $datetime]);
+    }
+    
+    // Функція для виклику з CRM
+    public function make_call() {
+        $phone_number = $this->input->post('phone');
+
+        if (empty($phone_number)) {
+            echo json_encode(['status' => 'error', 'message' => 'Номер телефону не вказано.']);
+            return;
+        }
+
+        $apiKey = get_option('binotel_api_key');
+
+        $secret = get_option('binotel_secret');// Змініть на ваш секретний ключ
+
+        $response = $this->make_binotel_call($phone_number, $apiKey, $secret);
+
+        echo json_encode(['status' => 'success', 'message' => $response]);
+    }
+    
+    
+
+    private function make_binotel_call($phone, $apiKey, $secret) {
+        $url = 'https://api.binotel.com/api/4.0/calls/internal-number-to-external-number.json';
+        $internalNumber = get_option('binotel_internal_number'); // Змініть на ваш внутрішній номер у Binotel
+
+        $data = [
+            'internalNumber' => $internalNumber,
+            'externalNumber' => $phone,
+            'key' => $apiKey,
+            'secret' => $secret,
+            'playbackWaiting'  => false 
+        ];
+
+        $json_data = json_encode($data);
+
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+        curl_setopt($ch, CURLOPT_POST, 1);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $json_data);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Content-Type: application/json',
+            'Content-Length: ' . strlen($json_data)
+        ]);
+
+        $response = curl_exec($ch);
+        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+        curl_close($ch);
+
+        if ($http_code == 200) {
+            return $response;
+        } else {
+            return "Помилка при дзвінку: HTTP " . $http_code . " - " . $response;
+        }
+    }
+    
+    
+    private function convert_lead_to_client($lead_id, $client_id) {
+        // Перенесення записів дзвінків з таблиці лідів у таблицю клієнтів
+        $this->db->where('lead_id', $lead_id);
+        $call_records = $this->db->get(db_prefix() . 'binotel_call_statistics_leads')->result_array();
+
+        foreach ($call_records as $record) {
+            unset($record['id']);
+            $record['client_id'] = $client_id;
+            $record['lead_id'] = null;
+            $this->db->insert(db_prefix() . 'binotel_call_statistics_clients', $record);
+        }
+
+        // Видалення записів дзвінків з таблиці лідів
+        $this->db->where('lead_id', $lead_id);
+        $this->db->delete(db_prefix() . 'binotel_call_statistics_leads');
+    }
+    
+    
+    
+    
+    
+    // Функції фільтрації дзвінків (CRM)
+    public function get_filtered_calls() {
+        $lead_id = $this->input->post('lead_id');
+        $start_date = $this->input->post('start_date');
+        $end_date = $this->input->post('end_date');
+        $this->load->model('binotel_integration/Binotel_integration_model');
+        $call_statistics = $this->Binotel_integration_model->get_lead_call_statistics($lead_id, $start_date, $end_date);
+        if (!empty($call_statistics)) {
+            $this->load->view('call_statistics_partial_view', ['call_statistics' => $call_statistics]);
+        } else {
+            echo "<p>Записів розмов за цей період не знайдено</p>";
+        }
+    }
+    
+    public function get_filtered_calls_for_client() {
+        $client_id = $this->input->post('client_id');
+        $start_date = $this->input->post('start_date');
+        $end_date = $this->input->post('end_date');
+        $this->load->model('binotel_integration/Binotel_integration_model');
+        $call_statistics = $this->Binotel_integration_model->get_client_call_statistics($client_id, $start_date, $end_date);
+        if (!empty($call_statistics)) {
+            $this->load->view('call_statistics_partial_view_clients', ['call_statistics' => $call_statistics]);
+        } else {
+            echo "<p>Записів розмов за цей період не знайдено.</p>";
+        }
+    }
+    
+    public function get_filtered_calls_for_staff() {
+        $staff_id = $this->input->post('staff_id');
+        $start_date = $this->input->post('start_date');
+        $end_date = $this->input->post('end_date');
+        if (empty($staff_id)) {
+            echo json_encode(['status' => 'error', 'message' => 'ID співробітника не передано']);
+            return;
+        }
+        $this->load->model('binotel_integration/Binotel_integration_model');
+        $call_statistics = $this->Binotel_integration_model->get_staff_call_statistics($staff_id, $start_date, $end_date);
+        $html = $this->load->view('call_statistics_partial_view_staff', ['call_statistics' => $call_statistics], true);
+        echo json_encode(['status' => 'success', 'html' => $html]);
+    }
+    
+    public function load_staff_call_statistics() {
+        $staff_id = $this->input->get('staff_id');
+        if (!$staff_id) {
+            echo "ID співробітника не передано.";
+            return;
+        }
+        $staff = $this->db->select('staffid, firstname, lastname, phonenumber')
+                          ->where('staffid', $staff_id)
+                          ->get(db_prefix() . 'staff')
+                          ->row();
+        if (!$staff) {
+            echo "Співробітника не знайдено.";
+            return;
+        }
+        $this->load->model('binotel_integration/Binotel_integration_model');
+        $call_statistics = $this->Binotel_integration_model->get_staff_call_statistics($staff_id);
+        $data = [
+            'member' => $staff,
+            'call_statistics' => $call_statistics
+        ];
+        $this->load->view('staff_call_statistics', $data);
+    }
+}
+
