@@ -67,7 +67,7 @@
                     // Формуємо посилання для рядка (якщо воно задане в $note->link)
                     $rowLink = admin_url($note->link);
                     ?>
-                    <tr class="clickable-row" data-href="<?php echo $rowLink; ?>">
+                    <tr class="clickable-row" data-href="<?php echo $rowLink; ?>" style="cursor:pointer;">
                       <td><?php echo _dt($note->date); ?></td>
                       <td><?php echo $note->description; ?></td>
                       <td><?php echo ($note->isread == 1) ? 'Прочитано' : 'Не прочитано'; ?></td>
@@ -198,6 +198,18 @@ $(document).ready(function(){
   // Кнопка "Очистити"
   $('#clear_btn').click(function(){
     window.location.href = "<?php echo admin_url('binotel_integration/binotel_admin/binotel_notifications'); ?>";
+  });
+
+  // Клік по рядку таблиці -> перехід у картку ліда/клієнта
+  $('.clickable-row').on('click', function(e) {
+    if ($(e.target).closest('button, a, audio, .pagination').length) {
+      return;
+    }
+
+    var targetUrl = $(this).data('href');
+    if (targetUrl) {
+      window.location.href = targetUrl;
+    }
   });
 
   // Побудова графіка "Кількість дзвінків від кожного ліда"
