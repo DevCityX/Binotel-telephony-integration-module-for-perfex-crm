@@ -21,13 +21,22 @@ class Binotel_admin extends AdminController {
         $start_date = $this->input->get('start_date');
         $end_date   = $this->input->get('end_date');
 
+        $per_page = 100;
+        $page = max(1, (int) $this->input->get('page'));
+        $offset = ($page - 1) * $per_page;
+
         // Фільтрація дзвінків за датою
-        $this->db->order_by('date', 'DESC');
         if (!empty($start_date) && !empty($end_date)) {
             $this->db->where('date >=', $start_date . ' 00:00:00');
             $this->db->where('date <=', $end_date . ' 23:59:59');
         }
-        $data['notifications'] = $this->db->get(db_prefix().'binotel_notifications')->result();
+        $data['total_notifications'] = $this->db->count_all_results(db_prefix().'binotel_notifications', false);
+        $this->db->order_by('date', 'DESC');
+        $this->db->limit($per_page, $offset);
+        $data['notifications'] = $this->db->get()->result();
+        $data['current_page'] = $page;
+        $data['per_page'] = $per_page;
+        $data['total_pages'] = (int) ceil($data['total_notifications'] / $per_page);
 
         // Підрахунок нових лідів за період
         if (!empty($start_date) && !empty($end_date)) {
@@ -61,6 +70,16 @@ class Binotel_admin extends AdminController {
             $data['calls_per_client'] = [];
         }
 
+        $phones = [];
+        foreach ($data['notifications'] as $note) {
+            $additional = @unserialize($note->additional_data);
+            if (is_array($additional) && !empty($additional[0])) {
+                $phones[] = trim($additional[0]);
+            }
+        }
+
+        $recording_links = $this->find_recording_links_by_phones($phones);
+
         // Для кожного сповіщення підтягуємо recording_link із таблиць статистики
         foreach ($data['notifications'] as &$note) {
             $phone = '';
@@ -68,19 +87,7 @@ class Binotel_admin extends AdminController {
             if (is_array($additional) && !empty($additional[0])) {
                 $phone = trim($additional[0]);
             }
-            // Якщо номер знайдено, шукаємо recording_link у таблицях (спершу у лідів, потім у клієнтів, потім у співробітників)
-            if (!empty($phone)) {
-                $recordingLink = $this->find_recording_link_by_phone($phone, 'leads');
-                if (!$recordingLink) {
-                    $recordingLink = $this->find_recording_link_by_phone($phone, 'clients');
-                }
-                if (!$recordingLink) {
-                    $recordingLink = $this->find_recording_link_by_phone($phone, 'staff');
-                }
-                $note->recording_link = $recordingLink ? $recordingLink : '';
-            } else {
-                $note->recording_link = '';
-            }
+            $note->recording_link = (!empty($phone) && isset($recording_links[$phone])) ? $recording_links[$phone] : '';
         }
         unset($note);
 
@@ -89,27 +96,72 @@ class Binotel_admin extends AdminController {
     }
 
     /**
-     * Метод пошуку recording_link за номером телефону у заданій таблиці
-     * @param string $phone
+     * Метод пошуку recording_link для списку номерів у заданій таблиці.
+     * Повертає найсвіжіший recording_link по кожному номеру.
+     *
+     * @param array  $phones
      * @param string $type - 'leads', 'clients', 'staff'
-     * @return string|null
+     * @return array<string,string>
      */
-    private function find_recording_link_by_phone($phone, $type = 'leads') {
+    private function find_recording_links_in_table(array $phones, $type = 'leads') {
         $tables = [
             'leads'   => db_prefix().'binotel_call_statistics_leads',
             'clients' => db_prefix().'binotel_call_statistics_clients',
             'staff'   => db_prefix().'binotel_call_statistics_staff',
         ];
         if (!isset($tables[$type])) {
-            return null;
+            return [];
         }
+
+        $phones = array_values(array_unique(array_filter($phones)));
+        if (empty($phones)) {
+            return [];
+        }
+
         $tableName = $tables[$type];
-        $this->db->select('recording_link');
-        $this->db->where('contact_name', $phone);
+        $this->db->select('contact_name, recording_link');
+        $this->db->where_in('contact_name', $phones);
+        $this->db->where('recording_link !=', '');
         $this->db->order_by('call_time', 'DESC');
-        $this->db->limit(1);
-        $row = $this->db->get($tableName)->row();
-        return ($row && !empty($row->recording_link)) ? $row->recording_link : null;
+        $rows = $this->db->get($tableName)->result();
+
+        $recordings_by_phone = [];
+        foreach ($rows as $row) {
+            if (!isset($recordings_by_phone[$row->contact_name])) {
+                $recordings_by_phone[$row->contact_name] = $row->recording_link;
+            }
+        }
+
+        return $recordings_by_phone;
+    }
+
+    /**
+     * Пошук recording_link у пріоритеті: leads -> clients -> staff.
+     *
+     * @param array $phones
+     * @return array<string,string>
+     */
+    private function find_recording_links_by_phones(array $phones) {
+        $phones = array_values(array_unique(array_filter($phones)));
+        if (empty($phones)) {
+            return [];
+        }
+
+        $recordings = $this->find_recording_links_in_table($phones, 'leads');
+        $missing = array_values(array_diff($phones, array_keys($recordings)));
+
+        if (!empty($missing)) {
+            $client_recordings = $this->find_recording_links_in_table($missing, 'clients');
+            $recordings = $recordings + $client_recordings;
+            $missing = array_values(array_diff($phones, array_keys($recordings)));
+        }
+
+        if (!empty($missing)) {
+            $staff_recordings = $this->find_recording_links_in_table($missing, 'staff');
+            $recordings = $recordings + $staff_recordings;
+        }
+
+        return $recordings;
     }
 
     public function get_binotel_calls_list() {

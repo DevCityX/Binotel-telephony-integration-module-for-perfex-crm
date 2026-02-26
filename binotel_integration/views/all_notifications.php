@@ -48,6 +48,9 @@
         <!-- Таблиця дзвінків -->
         <div class="panel_s">
           <div class="panel-body">
+            <p>
+              Показано записів: <strong><?php echo count($notifications); ?></strong> із <strong><?php echo (int) $total_notifications; ?></strong>
+            </p>
             <?php if (!empty($notifications)): ?>
               <table class="table dt-table">
                 <thead>
@@ -96,6 +99,38 @@
               </table>
             <?php else: ?>
               <p>Записів немає.</p>
+            <?php endif; ?>
+
+            <?php if (!empty($total_pages) && $total_pages > 1): ?>
+              <nav aria-label="Навігація по сторінках дзвінків">
+                <ul class="pagination">
+                  <?php
+                    $queryParams = $_GET;
+                    $prevPage = max(1, (int) $current_page - 1);
+                    $nextPage = min((int) $total_pages, (int) $current_page + 1);
+                    $queryParams['page'] = $prevPage;
+                    $prevUrl = '?' . http_build_query($queryParams);
+                    $queryParams['page'] = $nextPage;
+                    $nextUrl = '?' . http_build_query($queryParams);
+                  ?>
+
+                  <li class="<?php echo ((int) $current_page <= 1) ? 'disabled' : ''; ?>">
+                    <a href="<?php echo ((int) $current_page <= 1) ? '#' : $prevUrl; ?>" aria-label="Попередня">
+                      <span aria-hidden="true">&laquo;</span>
+                    </a>
+                  </li>
+
+                  <li class="active">
+                    <span>Сторінка <?php echo (int) $current_page; ?> з <?php echo (int) $total_pages; ?></span>
+                  </li>
+
+                  <li class="<?php echo ((int) $current_page >= (int) $total_pages) ? 'disabled' : ''; ?>">
+                    <a href="<?php echo ((int) $current_page >= (int) $total_pages) ? '#' : $nextUrl; ?>" aria-label="Наступна">
+                      <span aria-hidden="true">&raquo;</span>
+                    </a>
+                  </li>
+                </ul>
+              </nav>
             <?php endif; ?>
           </div>
         </div>
