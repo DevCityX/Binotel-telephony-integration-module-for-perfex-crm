@@ -449,8 +449,9 @@ class Binotel_integration extends CI_Controller {
             return $this->json_response(['status' => 'error', 'message' => 'Не вдалося завантажити аудіозапис.'], 500);
         }
 
-        $transcription = $this->request_openai_transcription($audio_file, $api_key, $model);
-        @unlink($audio_file);
+          $transcription = $this->request_openai_transcription($audio_file['path'], $audio_file['mime'], $audio_file['filename'], $api_key, $model);
+        @unlink($audio_file['path']);
+
 
         if (!$transcription['success']) {
             $this->Binotel_integration_model->update_transcription($entity_type, $call_id, [
@@ -482,15 +483,35 @@ class Binotel_integration extends CI_Controller {
         }
 
         file_put_contents($tmp, $content);
-        return $tmp;
+        $basename = pathinfo(parse_url($url, PHP_URL_PATH) ?? '', PATHINFO_BASENAME);
+        $url_extension = strtolower((string) pathinfo($basename, PATHINFO_EXTENSION));
+        $detected_mime = $this->detect_audio_mime_type($tmp);
+
+        $extension = $this->normalize_audio_extension($url_extension, $detected_mime);
+        $mime = $this->mime_from_extension($extension);
+
+        if ($basename === '') {
+            $filename = 'recording.' . $extension;
+        } else {
+            $name_without_extension = pathinfo($basename, PATHINFO_FILENAME);
+            $safe_name = $name_without_extension !== '' ? $name_without_extension : 'recording';
+            $filename = $safe_name . '.' . $extension;
+        }
+
+        return [
+            'path' => $tmp,
+            'mime' => $mime,
+            'filename' => $filename,
+        ];
+    
     }
 
-    private function request_openai_transcription($file_path, $api_key, $model) {
+    private function request_openai_transcription($file_path, $mime, $filename, $api_key, $model) {
         $ch = curl_init('https://api.openai.com/v1/audio/transcriptions');
 
         $post_fields = [
             'model' => $model,
-            'file' => new CURLFile($file_path, 'audio/mpeg', basename($file_path) . '.mp3'),
+            'file' => new CURLFile($file_path, $mime, $filename),
             'response_format' => 'json',
             'language' => 'uk',
         ];
@@ -527,6 +548,73 @@ class Binotel_integration extends CI_Controller {
 
         return ['success' => true, 'text' => $text];
     }
+    
+     private function detect_audio_mime_type($file_path) {
+        if (function_exists('finfo_open')) {
+            $finfo = finfo_open(FILEINFO_MIME_TYPE);
+            if ($finfo) {
+                $mime = finfo_file($finfo, $file_path);
+                finfo_close($finfo);
+                if (is_string($mime) && $mime !== '') {
+                    return $mime;
+                }
+            }
+        }
+
+        return 'application/octet-stream';
+    }
+
+    private function normalize_audio_extension($url_extension, $detected_mime) {
+        $supported_extensions = [
+            'flac',
+            'm4a',
+            'mp3',
+            'mp4',
+            'mpeg',
+            'mpga',
+            'oga',
+            'ogg',
+            'wav',
+            'webm',
+        ];
+
+        if (in_array($url_extension, $supported_extensions, true)) {
+            return $url_extension;
+        }
+
+        $map = [
+            'audio/mpeg' => 'mp3',
+            'audio/mp3' => 'mp3',
+            'audio/wav' => 'wav',
+            'audio/x-wav' => 'wav',
+            'audio/webm' => 'webm',
+            'audio/ogg' => 'ogg',
+            'audio/mp4' => 'm4a',
+            'audio/x-m4a' => 'm4a',
+            'audio/mpga' => 'mpga',
+            'audio/flac' => 'flac',
+            'audio/x-flac' => 'flac',
+        ];
+
+        return $map[$detected_mime] ?? 'mp3';
+    }
+
+    private function mime_from_extension($extension) {
+        $map = [
+            'flac' => 'audio/flac',
+            'm4a' => 'audio/mp4',
+            'mp3' => 'audio/mpeg',
+            'mp4' => 'audio/mp4',
+            'mpeg' => 'audio/mpeg',
+            'mpga' => 'audio/mpeg',
+            'oga' => 'audio/ogg',
+            'ogg' => 'audio/ogg',
+            'wav' => 'audio/wav',
+            'webm' => 'audio/webm',
+        ];
+
+        return $map[$extension] ?? 'audio/mpeg';
+    }
 
     private function json_response($payload, $status_code = 200) {
         $this->output
@@ -537,4 +625,3 @@ class Binotel_integration extends CI_Controller {
         return;
     }
 }
-
