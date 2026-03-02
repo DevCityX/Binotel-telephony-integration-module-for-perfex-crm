@@ -442,16 +442,26 @@ class Binotel_integration extends CI_Controller {
         ]);
 
         $audio_file = $this->download_audio_file($call['recording_link']);
-        if (!$audio_file) {
+      
+        if (!empty($audio_file['error'])) {
             $this->Binotel_integration_model->update_transcription($entity_type, $call_id, [
                 'transcription_status' => 'failed',
             ]);
-            return $this->json_response(['status' => 'error', 'message' => 'Не вдалося завантажити аудіозапис.'], 500);
+            
+            return $this->json_response(['status' => 'error', 'message' => $audio_file['error']], 500);
         }
 
-          $transcription = $this->request_openai_transcription($audio_file['path'], $audio_file['mime'], $audio_file['filename'], $api_key, $model);
-        @unlink($audio_file['path']);
+        $transcription = $this->request_openai_transcription($audio_file['path'], $audio_file['mime'], $audio_file['filename'], $api_key, $model);
 
+        if (!$transcription['success'] && $this->should_retry_transcription_with_mp3($transcription['message'])) {
+            $converted_file = $this->convert_audio_to_mp3($audio_file['path']);
+            if ($converted_file) {
+                $transcription = $this->request_openai_transcription($converted_file['path'], $converted_file['mime'], $converted_file['filename'], $api_key, $model);
+                @unlink($converted_file['path']);
+            }
+        }
+
+        @unlink($audio_file['path']);
 
         if (!$transcription['success']) {
             $this->Binotel_integration_model->update_transcription($entity_type, $call_id, [
@@ -476,18 +486,57 @@ class Binotel_integration extends CI_Controller {
 
     private function download_audio_file($url) {
         $tmp = tempnam(sys_get_temp_dir(), 'binotel_call_');
-        $content = @file_get_contents($url);
-        if ($content === false) {
-            @unlink($tmp);
-            return null;
+       
+
+        $request = $this->execute_audio_download_request($url, true);
+        $used_auth_fallback = false;
+
+        if (($request['content'] === false || $request['http_code'] >= 400 || $this->looks_like_text_payload('application/octet-stream', $this->normalize_content_type($request['content_type']), (string) $request['content']))
+            && $this->is_binotel_recording_url($url)) {
+            $auth_url = $this->build_authorized_recording_url($url);
+            $request = $this->execute_audio_download_request($auth_url, false);
+            $used_auth_fallback = true;
         }
 
-        file_put_contents($tmp, $content);
+        if ($request['content'] === false || $request['http_code'] >= 400) {
+            @unlink($tmp);
+           
+            return ['error' => $this->build_download_error_message($request, $used_auth_fallback)];
+        }
+
+        $normalized_header_mime = $this->normalize_content_type($request['content_type']);
+        if ($this->looks_like_text_payload('application/octet-stream', $normalized_header_mime, $request['content'])) {
+            $candidate_urls = $this->extract_audio_urls_from_html((string) $request['content'], $url);
+            foreach ($candidate_urls as $candidate_url) {
+                $candidate_request = $this->execute_audio_download_request($candidate_url, false);
+                if ($candidate_request['content'] === false || $candidate_request['http_code'] >= 400) {
+                    continue;
+                }
+
+                $candidate_mime = $this->normalize_content_type($candidate_request['content_type']);
+                if ($this->looks_like_text_payload('application/octet-stream', $candidate_mime, $candidate_request['content'])) {
+                    continue;
+                }
+
+                $request = $candidate_request;
+                $url = $candidate_url;
+                $normalized_header_mime = $candidate_mime;
+                break;
+            }
+        }
+
+        file_put_contents($tmp, $request['content']);
+
         $basename = pathinfo(parse_url($url, PHP_URL_PATH) ?? '', PATHINFO_BASENAME);
         $url_extension = strtolower((string) pathinfo($basename, PATHINFO_EXTENSION));
         $detected_mime = $this->detect_audio_mime_type($tmp);
 
-        $extension = $this->normalize_audio_extension($url_extension, $detected_mime);
+        if ($this->looks_like_text_payload($detected_mime, $normalized_header_mime, $request['content'])) {
+            @unlink($tmp);
+            return ['error' => $this->build_download_error_message($request, $used_auth_fallback, 'отримано не аудіо, а HTML/текст')];
+        }
+
+        $extension = $this->normalize_audio_extension($url_extension, $detected_mime, $normalized_header_mime);
         $mime = $this->mime_from_extension($extension);
 
         if ($basename === '') {
@@ -503,7 +552,191 @@ class Binotel_integration extends CI_Controller {
             'mime' => $mime,
             'filename' => $filename,
         ];
-    
+    }
+
+    private function execute_audio_download_request($url, $strict_ssl = true) {
+        $ch = curl_init($url);
+        $headers = [
+            'Accept: audio/*,*/*;q=0.8',
+        ];
+
+        $api_key = trim((string) get_option('binotel_api_key'));
+        $secret = trim((string) get_option('binotel_secret'));
+
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_CONNECTTIMEOUT => 15,
+            CURLOPT_TIMEOUT => 60,
+            CURLOPT_USERAGENT => 'PerfexBinotelModule/1.0',
+            CURLOPT_HTTPHEADER => $headers,
+        ]);
+
+        if ($api_key !== '' && $secret !== '' && $this->is_binotel_recording_url($url)) {
+            curl_setopt($ch, CURLOPT_USERPWD, $api_key . ':' . $secret);
+        }
+
+        if (!$strict_ssl) {
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+        }
+
+        $content = curl_exec($ch);
+        $http_code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $content_type = (string) curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
+        $curl_errno = curl_errno($ch);
+        $curl_error = curl_error($ch);
+        curl_close($ch);
+
+        if ($strict_ssl && $content === false && in_array($curl_errno, [35, 51, 58, 60], true)) {
+            return $this->execute_audio_download_request($url, false);
+        }
+
+        return [
+            'content' => $content,
+            'http_code' => $http_code,
+            'content_type' => $content_type,
+            'curl_errno' => $curl_errno,
+            'curl_error' => $curl_error,
+        ];
+    }
+
+    private function is_binotel_recording_url($url) {
+        $host = strtolower((string) parse_url($url, PHP_URL_HOST));
+        return $host !== '' && strpos($host, 'binotel') !== false;
+    }
+
+    private function build_authorized_recording_url($url) {
+        $api_key = trim((string) get_option('binotel_api_key'));
+        $secret = trim((string) get_option('binotel_secret'));
+
+        if ($api_key === '' || $secret === '') {
+            return $url;
+        }
+
+        $parts = parse_url($url);
+        if (!is_array($parts) || empty($parts['host'])) {
+            return $url;
+        }
+
+        $query = [];
+        if (!empty($parts['query'])) {
+            parse_str($parts['query'], $query);
+        }
+
+        if (!isset($query['apiKey'])) {
+            $query['apiKey'] = $api_key;
+        }
+        if (!isset($query['key'])) {
+            $query['key'] = $api_key;
+        }
+
+        if (!isset($query['secret'])) {
+            $query['secret'] = $secret;
+        }
+
+        $scheme = $parts['scheme'] ?? 'https';
+        $path = $parts['path'] ?? '';
+        $query_string = http_build_query($query);
+
+        return $scheme . '://' . $parts['host'] . $path . ($query_string !== '' ? ('?' . $query_string) : '');
+    }
+
+    private function extract_audio_urls_from_html($html, $base_url) {
+        if (!is_string($html) || trim($html) === '') {
+            return [];
+        }
+
+        $urls = [];
+        $patterns = [
+            '/<(?:audio|source)[^>]+src=["\']([^"\']+)["\']/i',
+            '/<(?:a|link)[^>]+href=["\']([^"\']+)["\']/i',
+            '/data-(?:audio|src|url)=["\']([^"\']+)["\']/i',
+            '/["\'](https?:\/\/[^"\'<>\s]+)["\']/i',
+            '/["\'](\/[^"\'<>\s]+)["\']/i',
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (preg_match_all($pattern, $html, $matches) && !empty($matches[1])) {
+                foreach ($matches[1] as $match) {
+                    $decoded = html_entity_decode((string) $match, ENT_QUOTES, 'UTF-8');
+                    $decoded = str_replace('\\/', '/', $decoded);
+                    $resolved = $this->resolve_relative_url($base_url, $decoded);
+                    if ($resolved !== '') {
+                        $urls[] = $resolved;
+                    }
+                }
+            }
+        }
+
+        $urls = array_values(array_unique($urls));
+
+       
+        usort($urls, function ($a, $b) {
+            $a_score = preg_match('/\.(mp3|wav|ogg|m4a|webm|flac)(\?|$)/i', $a) ? 1 : 0;
+            $b_score = preg_match('/\.(mp3|wav|ogg|m4a|webm|flac)(\?|$)/i', $b) ? 1 : 0;
+            return $b_score <=> $a_score;
+        });
+
+        return $urls;
+    }
+
+   
+    private function resolve_relative_url($base_url, $candidate) {
+        $candidate = trim((string) $candidate);
+        if ($candidate === '') {
+            return '';
+        }
+
+        if (preg_match('/^https?:\/\//i', $candidate)) {
+            return $candidate;
+        }
+
+        if (strpos($candidate, '//') === 0) {
+            $scheme = parse_url($base_url, PHP_URL_SCHEME) ?: 'https';
+            return $scheme . ':' . $candidate;
+        }
+
+        $scheme = parse_url($base_url, PHP_URL_SCHEME) ?: 'https';
+        $host = parse_url($base_url, PHP_URL_HOST);
+        if (!$host) {
+            return '';
+        }
+
+        $port = parse_url($base_url, PHP_URL_PORT);
+        $host_part = $scheme . '://' . $host . ($port ? ':' . $port : '');
+
+        if (strpos($candidate, '/') === 0) {
+            return $host_part . $candidate;
+        }
+
+        $path = parse_url($base_url, PHP_URL_PATH) ?: '/';
+        $dir = rtrim(str_replace('\\', '/', dirname($path)), '/');
+        return $host_part . ($dir ? $dir : '') . '/' . ltrim($candidate, '/');
+    }
+
+    private function build_download_error_message($request, $used_auth_fallback = false, $reason = '') {
+        $parts = ['Не вдалося завантажити аудіозапис'];
+
+        if ($reason !== '') {
+            $parts[] = $reason;
+        }
+
+        if (!empty($request['http_code']) && (int) $request['http_code'] >= 400) {
+            $parts[] = 'HTTP ' . (int) $request['http_code'];
+        }
+
+        if (!empty($request['curl_error'])) {
+            $parts[] = 'cURL: ' . $request['curl_error'];
+        }
+
+        if ($used_auth_fallback) {
+            $parts[] = 'після повторної авторизованої спроби через Binotel';
+        }
+
+        $parts[] = 'Перевірте доступ до запису в кабінеті Binotel та коректність API key/secret у налаштуваннях модуля';
+
+        return implode('. ', $parts) . '.';
     }
 
     private function request_openai_transcription($file_path, $mime, $filename, $api_key, $model) {
@@ -548,8 +781,8 @@ class Binotel_integration extends CI_Controller {
 
         return ['success' => true, 'text' => $text];
     }
-    
-     private function detect_audio_mime_type($file_path) {
+
+    private function detect_audio_mime_type($file_path) {
         if (function_exists('finfo_open')) {
             $finfo = finfo_open(FILEINFO_MIME_TYPE);
             if ($finfo) {
@@ -564,7 +797,7 @@ class Binotel_integration extends CI_Controller {
         return 'application/octet-stream';
     }
 
-    private function normalize_audio_extension($url_extension, $detected_mime) {
+    private function normalize_audio_extension($url_extension, $detected_mime, $header_mime = '') {
         $supported_extensions = [
             'flac',
             'm4a',
@@ -596,7 +829,81 @@ class Binotel_integration extends CI_Controller {
             'audio/x-flac' => 'flac',
         ];
 
-        return $map[$detected_mime] ?? 'mp3';
+        if (isset($map[$detected_mime])) {
+            return $map[$detected_mime];
+        }
+
+        if ($header_mime !== '' && isset($map[$header_mime])) {
+            return $map[$header_mime];
+        }
+
+        return 'mp3';
+    }
+
+    private function normalize_content_type($content_type) {
+        $value = strtolower(trim((string) $content_type));
+        if ($value === '') {
+            return '';
+        }
+
+        $parts = explode(';', $value);
+        return trim($parts[0]);
+    }
+
+    private function looks_like_text_payload($detected_mime, $header_mime, $content) {
+        $text_mimes = [
+            'text/html',
+            'text/plain',
+            'application/json',
+            'application/xml',
+            'text/xml',
+        ];
+
+        if (in_array($detected_mime, $text_mimes, true) || in_array($header_mime, $text_mimes, true)) {
+            return true;
+        }
+
+        $sample = ltrim(substr((string) $content, 0, 256));
+        return stripos($sample, '<!doctype html') === 0 || stripos($sample, '<html') === 0;
+    }
+
+    private function should_retry_transcription_with_mp3($message) {
+        $msg = strtolower((string) $message);
+        return strpos($msg, 'unsupported file format') !== false
+            || strpos($msg, 'corrupted or unsupported') !== false
+            || strpos($msg, 'invalid file format') !== false;
+    }
+
+    private function convert_audio_to_mp3($source_path) {
+        $ffmpeg_bin = trim((string) @shell_exec('command -v ffmpeg'));
+        if ($ffmpeg_bin === '') {
+            return null;
+        }
+
+        $target_path = tempnam(sys_get_temp_dir(), 'binotel_call_mp3_');
+        if ($target_path === false) {
+            return null;
+        }
+
+        $target_mp3 = $target_path . '.mp3';
+        @unlink($target_path);
+
+        $command = escapeshellcmd($ffmpeg_bin)
+            . ' -y -i ' . escapeshellarg($source_path)
+            . ' -vn -ar 16000 -ac 1 -b:a 64k ' . escapeshellarg($target_mp3) . ' 2>&1';
+
+        @exec($command, $output, $code);
+
+        if ($code !== 0 || !file_exists($target_mp3) || filesize($target_mp3) === 0) {
+            @unlink($target_mp3);
+            return null;
+        }
+
+        return [
+            'path' => $target_mp3,
+            'mime' => 'audio/mpeg',
+            'filename' => 'recording.mp3',
+        ];
     }
 
     private function mime_from_extension($extension) {
